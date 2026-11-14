@@ -61,12 +61,14 @@ class BoardEncodeDecode l where
     encode :: (BoardCoord l) -> Int -> Int -> l -> Int
     decode :: (BoardCoord l) -> Int -> (Int, Int, l)
 
-    encode bc x y l = let offset = size bc * forward_map bc l
-                          x' = x + offset
-                       in x' * (layer_count bc * size bc) + y
-    decode bc z = let (x, y) = divMod z (layer_count bc * size bc)
-                      l = backward_map bc $ x `div` (size bc)
-                   in (x `mod` size bc, y `mod` size bc, l)
+    encode bc x y l
+        | x < 0 || x >= size bc = error $ "Invalid x: " ++ show x
+        | y < 0 || y >= size bc = error $ "Invalid y: " ++ show y
+        | forward_map bc l < 0 || forward_map bc l >= size bc = error $ "Invalid y: " ++ show (forward_map bc l)
+        | otherwise = (forward_map bc l * (size bc) + x) * (size bc) + y
+    decode bc z = let (lx, y) = divMod z $ size bc
+                      (l, x) = divMod lx $ size bc
+                   in (x, y, backward_map bc l)
 
 instance BoardEncodeDecode Layer
 
@@ -145,21 +147,41 @@ encodeNxNQueen bc k = noSameSpot <> foldl' (\acc f -> f White <> f Black <> acc)
     --     = propagation or not previous_prop or not (white or black) = propagation or (not previous_prop or (not white and not black)) =
     --     = propagation or ((not previous_prop or not white) and (not previous_prop or not black)) =
     --     = (propagation or not previous_prop or not white) and (propagation or not previous_prop or not black)
-    sums c = CNF [Clause [Pos $ encode bc 0 0 (LSum 0 c)]] <> encodeNext 0 0
+    -- also need the other diction so it's an iff, not just <-, i.e. x,y,(LSum z) -> (x,y)-1,(LSum z) or ((x,y)-1,(LSum z - 1) and (x,y)-1,{LWhite|LBlack})
+    -- 3) x,y,(LSum z) -> (x,y)-1,(LSum z) = not x,y,(LSum z) or (x,y)-1,(LSum z)
+    -- 4) P -> (PP and (W or B) = not P or (PP and (W or B)) = (not P or PP) and (not P or W or B)
+    sums c = CNF [ Clause [Pos $ encode bc 0 0 $ LSum 0 c]
+                 , Clause [Neg $ encode bc 0 0 $ LSum 1 c, Pos $ encode bc 0 0 $ colToLayer c] -- these two encode the case if a queen is on (0,0)
+                 , Clause [Pos $ encode bc 0 0 $ LSum 1 c, Neg $ encode bc 0 0 $ colToLayer c] --
+                 ]
+          <> CNF [ Clause [Neg $ encode bc 0 0 $ LSum z c] -- propagate 0,0,LSum z>=2 is false
+                 | z <- [2..k+1] ]
+          <> encodeNext 0 0
       where
-        encodeRule1 x y prev_x prev_y = CNF [ Clause [Pos $ encode bc x y (LSum z c), Neg $ encode bc prev_x prev_y (LSum z c)]
+        encodeRule1 x y prev_x prev_y = CNF [ Clause [Pos $ encode bc x y $ LSum z c, Neg $ encode bc prev_x prev_y $ LSum z c]
                                             | z <- [0..k+1] ]
         encodeRule2 x y prev_x prev_y = CNF [ Clause [ Pos $ encode bc x y $ LSum z c
                                                      , Neg $ encode bc prev_x prev_y $ LSum (z - 1) c
                                                      , Neg $ encode bc x y $ colToLayer c
                                                      ]
                                             | z <- [1..k+1] ]
+        encodeRule3 x y prev_x prev_y = CNF [ Clause [Neg $ encode bc x y $ LSum z c, Pos $ encode bc prev_x prev_y $ LSum z c]
+                                            | z <- [0..k+1] ]
+        encodeRule4 x y prev_x prev_y = CNF $ mconcat [ [Clause [ Neg $ encode bc x y $ LSum z c
+                                                                , Pos $ encode bc prev_x prev_y $ LSum (z - 1) c
+                                                                ]
+                                                        , Clause [ Neg $ encode bc x y $ LSum z c
+                                                                 , Pos $ encode bc x y $ colToLayer c
+                                                                 ]
+                                                        ]
+                                                      | z <- [0..k+1] ]
         encodeNext x y = case advance x y of
-                            Just (next_x, next_y) -> mconcat $ encodeNext next_x next_y : map (\f -> f next_x next_y x y) [encodeRule2, encodeRule1]
+                            Just (next_x, next_y) -> mconcat $ encodeNext next_x next_y : map (\f -> f next_x next_y x y) [encodeRule1, encodeRule2, encodeRule3, encodeRule4]
                             Nothing -> CNF []
         advance x y
-            | y == n = Nothing -- end of the board
-            | otherwise = Just ((x + 1) `mod` n, if x + 1 >= n then y + 1 else y)
+            | x + 1 < n = Just (x + 1, y)
+            | y + 1 < n = Just (0, y + 1)
+            | otherwise = Nothing
 
     allSafe = mconcat [ safe x y c | x <- [0..n-1], y <- [0..n-1], c <- [White, Black] ]
 
@@ -185,7 +207,7 @@ encodeNxNQueen bc k = noSameSpot <> foldl' (\acc f -> f White <> f Black <> acc)
     --      = not A or (not (x+1),(y+1),!c and ... until (n - 1),(n - 1),!c)
     safe x y c = row <> column <> mconcat [ diag dx dy xLim yLim
                                           | dx <- [1, -1], dy <- [1, -1]
-                                          | xLim <- [n, 0], yLim <- [n, 0] ]
+                                          | xLim <- [(n - 1), 0], yLim <- [(n - 1), 0] ]
       where
         c' = colToLayer c
         otherC = otherCol c
@@ -205,4 +227,4 @@ fullDimacs :: CNF -> String
 fullDimacs cnf = dimacsHeader (variableCount cnf) (length $ unCNF $ cnf) <> ('\n' : toDimacs cnf)
 
 main :: IO ()
-main = writeFile "encoding.cnf" $ fullDimacs $ encodeNxNQueen (makeBoardCoord 2 4) 4
+main = writeFile "encoding.cnf" $ fullDimacs $ encodeNxNQueen (makeBoardCoord 4 2) 2
