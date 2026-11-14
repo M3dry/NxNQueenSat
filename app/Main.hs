@@ -2,12 +2,15 @@
 
 module Main (main) where
 
-import Data.Monoid
+import Data.List (singleton)
 import Control.Monad (join)
 import Control.Arrow ((***))
 
 class ToDimacs a where
     toDimacs :: a -> String
+
+class ToCNF a where
+    toCnf :: a -> CNF
 
 data Lit = Pos Int
          | Neg Int
@@ -17,6 +20,20 @@ newtype Clause = Clause [Lit]
     deriving (Eq, Show, Semigroup, Monoid)
 newtype CNF = CNF [Clause]
     deriving (Eq, Show, Semigroup, Monoid)
+
+newtype ElementaryConjunction = ElemConj [Lit]
+    deriving (Eq, Show, Semigroup, Monoid)
+newtype DNF = DNF [ElementaryConjunction]
+    deriving (Eq, Show, Semigroup, Monoid)
+
+data Color = White | Black
+    deriving (Eq, Show)
+
+data BoardCoord = BoardCoord
+    { encode :: Int -> Int -> Color -> Int
+    , decode :: Int -> (Int, Int, Color)
+    , size :: Int
+    }
 
 instance ToDimacs Lit where
     toDimacs (Pos i) = show i
@@ -28,14 +45,12 @@ instance ToDimacs Clause where
 instance ToDimacs CNF where
     toDimacs (CNF cnf) = foldr (\clause acc -> toDimacs clause ++ ('\n' : acc)) "" cnf
 
-data Color = White | Black
-    deriving (Eq, Show)
+instance ToCNF ElementaryConjunction where
+    toCnf (ElemConj lits) = CNF $ map (Clause . singleton) lits
 
-data BoardCoord = BoardCoord
-    { encode :: Int -> Int -> Color -> Int
-    , decode :: Int -> (Int, Int, Color)
-    , size :: Int
-    }
+instance ToCNF DNF where
+    toCnf (DNF []) = CNF []
+    toCnf (DNF es) = CNF $ map Clause $ sequence [ls | ElemConj ls <- es]
 
 makeBoardCoord :: Int -> BoardCoord
 makeBoardCoord n = BoardCoord
@@ -55,14 +70,19 @@ encodeNxNQueen bc k = noSameSpot <> kOfColor White <> kOfColor Black
     -- (w and not b) or (not w and b)
     -- (w or not w) and (w or b) and (not b or not w) and (not b or b)
     -- (w or b) and (not b or not w)
-    noSameSpot = CNF $ concat [ let encoder = encode bc x y
-                                    w = encoder White
-                                    b = encoder Black
-                                 in map Clause [map Pos [w, b], map Neg [w, b]]
-                                  | x <- [0..size bc], y <- [0..size bc] ]
+    noSameSpot = CNF [ let encoder = encode bc x y
+                           w = encoder White
+                           b = encoder Black
+                        in Clause $ map Neg [w, b]
+                     | x <- [0..(size bc - 1)], y <- [0..(size bc - 1)] ]
     -- exactly k tiles of color c are true
-    kOfColor c = CNF []
+    -- k-clenna podmnozina [k]x[k] sjednocena na and <- DNF encoding, prevod na CNF exponencialni, mozna existuje lepsi reseni
+    kOfColor c = toCnf $ DNF $ map (ElemConj . map (Pos . uncurry (flip flip c . encode bc))) $ subsets k [ (x, y) | x <- [0..(size bc - 1)], y <- [0..(size bc - 1)] ]
 
+subsets :: Int -> [a] -> [[a]]
+subsets 0 _ = [[]]
+subsets _ [] = []
+subsets n (x:xs) = [ x : s | s <- subsets (n - 1) xs ] ++ subsets n xs
 
 main :: IO ()
 main = putStrLn "Hello, Haskell!"
