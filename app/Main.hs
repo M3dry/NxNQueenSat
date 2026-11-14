@@ -1,6 +1,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE ParallelListComp #-}
 
 module Main (main) where
 
@@ -105,7 +106,7 @@ makeBoardCoord n k = BoardCoord
     layer_count = 2 + k
 
 encodeNxNQueen :: BoardCoord Layer -> Int -> CNF
-encodeNxNQueen bc k = noSameSpot <> foldl' (\acc f -> f White <> f Black <> acc) mempty [sums, kOfColor]
+encodeNxNQueen bc k = noSameSpot <> foldl' (\acc f -> f White <> f Black <> acc) mempty [sums, kOfColor] <> allSafe
   where
     n = size bc
     -- for all. x,y (encode x y White) != (encode x y Black) .. in truth values
@@ -150,8 +151,42 @@ encodeNxNQueen bc k = noSameSpot <> foldl' (\acc f -> f White <> f Black <> acc)
             | y == n = Nothing -- end of the board
             | otherwise = Just (x + 1 `mod` n, if x + 1 >= n then y + 1 else y)
 
+    allSafe = mconcat [ safe x y c | x <- [0..n-1], y <- [0..n-1], c <- [White, Black] ]
+
     -- if x,y,c, then diagonals + x row + y column all are false for the other color
-    safe x y c = undefined
+    -- A = x,y,c
+    -- 1) A -> row
+    --  = not A or (row)
+    --  row = not 0,y,!c and not 1,y,!c .... and not (n -1),y,!c ... excluding not x,y,!c (since that's true via noSameSpot)
+    --  = not A or (not 0,y,!c and not 1,y,!c .... and not (n -1),y,!c)
+    --  = (not A or not 0,y,!c) and (not A or not 1,y,!c) and ... and (not A or not (n - 1),y,!c)
+    -- 2) A -> column
+    --    = not A or (column)
+    --    = not A or (not x,0,!c and not x,1,!c and ... and not x,(n - 1),!c) ... excluding x,y,!c
+    --    = (not A or not x,0,!c) and ... and ... (not A or not x,(n - 1), !c)
+    -- 3) A -> diagonals = A -> (diagonal to top left and diagonal to bottom left and diagonal to top right and diagonal to botom right)
+    -- 3.1) A -> diagonal to top left
+    --      = not A or (not (x-1),(y-1),!c and ... until 0,0,!c)
+    -- 3.2) A -> diagonal to bottom left
+    --      = not A or (not (x-1),(y+1),!c and ... until 0,(n-1),!c)
+    -- 3.3) A -> diagonal to top right
+    --      = not A or (not (x+1),(y-1),!c and ... until (n - 1),0,!c)
+    -- 3.4) A -> diagonal to bottom right
+    --      = not A or (not (x+1),(y+1),!c and ... until (n - 1),(n - 1),!c)
+    safe x y c = row <> column <> mconcat [ diag dx dy xLim yLim
+                                          | dx <- [1, -1], dy <- [1, -1]
+                                          | xLim <- [n, 0], yLim <- [n, 0] ]
+      where
+        c' = colToLayer c
+        otherC = otherCol c
+        otherC' = colToLayer otherC
+        notA = Neg $ encode bc x y c'
+
+        row = CNF [ Clause [notA, Neg $ encode bc x' y $ otherC'] | x' <- [0..(n - 1)], x' /= x ]
+        column = CNF [ Clause [notA, Neg $ encode bc x y' $ otherC'] | y' <- [0..(n - 1)], y' /= y ]
+        diag dx dy xLim yLim = CNF [ Clause [ notA, Neg $ encode bc x' y' $ otherC' ]
+                                   | x' <- drop 1 [x+dx..xLim]
+                                   | y' <- drop 1 [y+dy..yLim] ]
 
 main :: IO ()
 main = putStrLn "Hello, Haskell!"
