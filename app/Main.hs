@@ -20,13 +20,23 @@ data Lit = Pos Int
 
 newtype Clause = Clause [Lit]
     deriving (Eq, Show, Semigroup, Monoid)
+unClause :: Clause -> [Lit]
+unClause (Clause lits) = lits
+
 newtype CNF = CNF [Clause]
     deriving (Eq, Show, Semigroup, Monoid)
+unCNF :: CNF -> [Clause]
+unCNF (CNF cs) = cs
 
 newtype ElementaryConjunction = ElemConj [Lit]
     deriving (Eq, Show, Semigroup, Monoid)
+unElemConj :: ElementaryConjunction -> [Lit]
+unElemConj (ElemConj lits) = lits
+
 newtype DNF = DNF [ElementaryConjunction]
     deriving (Eq, Show, Semigroup, Monoid)
+unDNF :: DNF -> [ElementaryConjunction]
+unDNF (DNF es) = es
 
 data Color = White | Black
     deriving (Eq, Show, Enum, Bounded)
@@ -52,31 +62,31 @@ class BoardEncodeDecode l where
                       l = backward_map bc $ x `div` (size bc)
                    in (x `mod` size bc, y `mod` size bc, l)
 
-instance BoardEncodeDecode Layer where
+instance BoardEncodeDecode Layer
 
 instance ToDimacs Lit where
     toDimacs (Pos i) = show i
     toDimacs (Neg i) = '-' : show i
 
 instance ToDimacs Clause where
-    toDimacs (Clause clause) = foldr (\lit acc -> toDimacs lit ++ (' ' : acc)) "0" clause
+    toDimacs  = foldr (\lit acc -> toDimacs lit ++ (' ' : acc)) "0" . unClause
 
 instance ToDimacs CNF where
-    toDimacs (CNF cnf) = foldr (\clause acc -> toDimacs clause ++ ('\n' : acc)) "" cnf
+    toDimacs  = foldr (\clause acc -> toDimacs clause ++ ('\n' : acc)) "" . unCNF
 
 instance ToCNF ElementaryConjunction where
-    toCnf (ElemConj lits) = CNF $ map (Clause . singleton) lits
+    toCnf = CNF . map (Clause . singleton) . unElemConj
 
 instance ToCNF DNF where
-    toCnf (DNF []) = CNF []
-    toCnf (DNF es) = CNF $ map Clause $ sequence [ls | ElemConj ls <- es]
+    toCnf = CNF . map Clause . sequence . map unElemConj . unDNF
 
 colToLayer :: Color -> Layer
 colToLayer White = LWhite
 colToLayer Black = LBlack
 
-encodeColor :: BoardCoord Layer -> Int -> Int -> Color -> Int
-encodeColor bc x y c = encode bc x y (colToLayer c)
+otherCol :: Color -> Color
+otherCol White = Black
+otherCol Black = White
 
 makeBoardCoord :: Int -> Int -> BoardCoord Layer
 makeBoardCoord n k = BoardCoord
@@ -95,7 +105,7 @@ makeBoardCoord n k = BoardCoord
     layer_count = 2 + k
 
 encodeNxNQueen :: BoardCoord Layer -> Int -> CNF
-encodeNxNQueen bc k = noSameSpot <> sums White <> sums Black <> kOfColor White <> kOfColor Black
+encodeNxNQueen bc k = noSameSpot <> foldl' (\acc f -> f White <> f Black <> acc) mempty [sums, kOfColor]
   where
     n = size bc
     -- for all. x,y (encode x y White) != (encode x y Black) .. in truth values
@@ -104,15 +114,13 @@ encodeNxNQueen bc k = noSameSpot <> sums White <> sums Black <> kOfColor White <
     -- (w and not b) or (not w and b)
     -- (w or not w) and (w or b) and (not b or not w) and (not b or b)
     -- (w or b) and (not b or not w)
-    noSameSpot = CNF [ let encoder = encodeColor bc x y
-                           w = encoder White
-                           b = encoder Black
-                        in Clause $ map Neg [w, b]
+    noSameSpot = CNF [ Clause $ map (Neg . encode bc x y) [LWhite, LBlack]
                      | x <- [0..(n - 1)], y <- [0..(n - 1)] ]
     -- exactly k tiles of color c are true
     -- k-clenna podmnozina [k]x[k] sjednocena na and <- DNF encoding, prevod na CNF exponencialni, mozna existuje lepsi reseni
     -- kOfColor c = toCnf $ DNF $ map (ElemConj . map (Pos . uncurry (flip flip c . encode bc))) $ subsets k [ (x, y) | x <- [0..(n - 1)], y <- [0..(n - 1)] ]
-
+    --
+    -- better version using `sums`:
     -- end_x,end_y,LSum k is true and end_x,end_y,LSum K+1 is false
     kOfColor c = CNF [Clause [Pos $ encode bc (n - 1) (n - 1) $ LSum k c], Clause [Neg $ encode bc (n - 1) (n - 1) $ LSum (k + 1) c]]
 
@@ -142,10 +150,8 @@ encodeNxNQueen bc k = noSameSpot <> sums White <> sums Black <> kOfColor White <
             | y == n = Nothing -- end of the board
             | otherwise = Just (x + 1 `mod` n, if x + 1 >= n then y + 1 else y)
 
-subsets :: Int -> [a] -> [[a]]
-subsets 0 _ = [[]]
-subsets _ [] = []
-subsets n (x:xs) = [ x : s | s <- subsets (n - 1) xs ] ++ subsets n xs
+    -- if x,y,c, then diagonals + x row + y column all are false for the other color
+    safe x y c = undefined
 
 main :: IO ()
 main = putStrLn "Hello, Haskell!"
