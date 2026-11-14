@@ -9,6 +9,8 @@ import Data.List (singleton)
 import Control.Monad (join)
 import Control.Arrow ((***), first)
 
+import System.IO (writeFile)
+
 class ToDimacs a where
     toDimacs :: a -> String
 
@@ -18,6 +20,9 @@ class ToCNF a where
 data Lit = Pos Int
          | Neg Int
     deriving (Eq, Show)
+unLit :: Lit -> Int
+unLit (Pos p) = p
+unLit (Neg p) = p
 
 newtype Clause = Clause [Lit]
     deriving (Eq, Show, Semigroup, Monoid)
@@ -65,9 +70,13 @@ class BoardEncodeDecode l where
 
 instance BoardEncodeDecode Layer
 
+-- dimacs variables start from 1, but already made the encoder use 0 based so + 1 is a quick hack (hopefully won't bite me later lol)
 instance ToDimacs Lit where
-    toDimacs (Pos i) = show i
-    toDimacs (Neg i) = '-' : show i
+    toDimacs (Pos i) = show $ i + 1
+    toDimacs (Neg i) = '-' : show (i + 1)
+
+dimacsHeader :: Int -> Int -> String
+dimacsHeader p_count clause_count = "p cnf " <> show p_count <> " " <> show clause_count
 
 instance ToDimacs Clause where
     toDimacs  = foldr (\lit acc -> toDimacs lit ++ (' ' : acc)) "0" . unClause
@@ -95,15 +104,16 @@ makeBoardCoord n k = BoardCoord
     , layer_count = layer_count
     , forward_map = \case LWhite -> 0
                           LBlack -> 1
-                          LSum x c -> 2 + k*(fromEnum c) + x
+                          LSum x c -> 2 + k'*(fromEnum c) + x
     , backward_map = \case 0 -> LWhite
                            1 -> LBlack
                            x -> let x' = x - 2
-                                    (c, x'') = first toEnum $ divMod x' k
+                                    (c, x'') = first toEnum $ divMod x' k'
                                  in LSum x'' c
     }
   where
-    layer_count = 2 + k
+    k' = k + 2 -- + 2 accounts for LSum (k + 1) and for LSum 0
+    layer_count = 2 + 2*(k')
 
 encodeNxNQueen :: BoardCoord Layer -> Int -> CNF
 encodeNxNQueen bc k = noSameSpot <> foldl' (\acc f -> f White <> f Black <> acc) mempty [sums, kOfColor] <> allSafe
@@ -149,7 +159,7 @@ encodeNxNQueen bc k = noSameSpot <> foldl' (\acc f -> f White <> f Black <> acc)
                             Nothing -> CNF []
         advance x y
             | y == n = Nothing -- end of the board
-            | otherwise = Just (x + 1 `mod` n, if x + 1 >= n then y + 1 else y)
+            | otherwise = Just ((x + 1) `mod` n, if x + 1 >= n then y + 1 else y)
 
     allSafe = mconcat [ safe x y c | x <- [0..n-1], y <- [0..n-1], c <- [White, Black] ]
 
@@ -185,8 +195,14 @@ encodeNxNQueen bc k = noSameSpot <> foldl' (\acc f -> f White <> f Black <> acc)
         row = CNF [ Clause [notA, Neg $ encode bc x' y $ otherC'] | x' <- [0..(n - 1)], x' /= x ]
         column = CNF [ Clause [notA, Neg $ encode bc x y' $ otherC'] | y' <- [0..(n - 1)], y' /= y ]
         diag dx dy xLim yLim = CNF [ Clause [ notA, Neg $ encode bc x' y' $ otherC' ]
-                                   | x' <- drop 1 [x+dx..xLim]
-                                   | y' <- drop 1 [y+dy..yLim] ]
+                                   | x' <- drop 1 [x,x+dx..xLim]
+                                   | y' <- drop 1 [y,y+dy..yLim] ]
+
+variableCount :: CNF -> Int
+variableCount cnf = maximum $ map (maximum . map ((+1) . unLit) . unClause) $ unCNF cnf
+
+fullDimacs :: CNF -> String
+fullDimacs cnf = dimacsHeader (variableCount cnf) (length $ unCNF $ cnf) <> ('\n' : toDimacs cnf)
 
 main :: IO ()
-main = putStrLn "Hello, Haskell!"
+main = writeFile "encoding.cnf" $ fullDimacs $ encodeNxNQueen (makeBoardCoord 2 4) 4
