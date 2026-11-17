@@ -2,47 +2,48 @@
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ParallelListComp #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE TupleSections #-}
 
 module Main (main) where
 
-import Data.List (singleton)
-import Control.Monad (join)
-import Control.Arrow ((***), first)
+import Data.List (singleton, stripPrefix)
+import Control.Arrow (first, Arrow ((***)))
 
-import System.IO (writeFile)
+import System.IO (hPutStr, hClose, hIsEOF, hGetLine, hFlush)
+import System.IO.Temp (withSystemTempFile)
+import System.Environment (getArgs, getProgName)
+import System.Process (createProcess, std_out, waitForProcess, proc, StdStream(..))
+import Control.Monad (join)
+
+import Data.Char (isSpace)
+import Data.Maybe (isJust)
 
 class ToDimacs a where
     toDimacs :: a -> String
 
-class ToCNF a where
-    toCnf :: a -> CNF
+class ToCNF t where
+    toCnf :: t a -> CNF a
 
-data Lit = Pos Int
-         | Neg Int
+data Lit a = Pos a
+           | Neg a
     deriving (Eq, Show)
-unLit :: Lit -> Int
+unLit :: Lit a -> a
 unLit (Pos p) = p
 unLit (Neg p) = p
 
-newtype Clause = Clause [Lit]
-    deriving (Eq, Show, Semigroup, Monoid)
-unClause :: Clause -> [Lit]
-unClause (Clause lits) = lits
+newtype Clause a = Clause { clause :: [Lit a] }
+    deriving (Eq, Show, Functor, Semigroup, Monoid)
 
-newtype CNF = CNF [Clause]
-    deriving (Eq, Show, Semigroup, Monoid)
-unCNF :: CNF -> [Clause]
-unCNF (CNF cs) = cs
+newtype CNF a = CNF { cnf :: [Clause a] }
+    deriving (Eq, Show, Functor, Semigroup, Monoid)
 
-newtype ElementaryConjunction = ElemConj [Lit]
-    deriving (Eq, Show, Semigroup, Monoid)
-unElemConj :: ElementaryConjunction -> [Lit]
-unElemConj (ElemConj lits) = lits
+newtype ElementaryConjunction a = ElemConj { elemConj :: [Lit a] }
+    deriving (Eq, Show, Functor, Semigroup, Monoid)
 
-newtype DNF = DNF [ElementaryConjunction]
-    deriving (Eq, Show, Semigroup, Monoid)
-unDNF :: DNF -> [ElementaryConjunction]
-unDNF (DNF es) = es
+newtype DNF a = DNF { dnf :: [ElementaryConjunction a] }
+    deriving (Eq, Show, Functor, Semigroup, Monoid)
 
 data Color = White | Black
     deriving (Eq, Show, Enum, Bounded)
@@ -57,6 +58,17 @@ data BoardCoord l = BoardCoord
     , backward_map :: Int -> l
     }
 
+data GlucoseLineOutput = Comment String
+                   | SATState Bool
+                   | WhiteSpace
+                    deriving (Show)
+
+data GlucoseRun = GlucoseRun
+                { satState :: Bool
+                , found_model :: Maybe [Lit Int]
+                }
+                deriving (Show)
+
 class BoardEncodeDecode l where
     encode :: (BoardCoord l) -> Int -> Int -> l -> Int
     decode :: (BoardCoord l) -> Int -> (Int, Int, l)
@@ -70,27 +82,31 @@ class BoardEncodeDecode l where
                       (l, x) = divMod lx $ size bc
                    in (x, y, backward_map bc l)
 
+instance Functor Lit where
+    fmap f (Pos a) = Pos $ f a
+    fmap f (Neg a) = Neg $ f a
+
 instance BoardEncodeDecode Layer
 
 -- dimacs variables start from 1, but already made the encoder use 0 based so + 1 is a quick hack (hopefully won't bite me later lol)
-instance ToDimacs Lit where
+instance ToDimacs (Lit Int) where
     toDimacs (Pos i) = show $ i + 1
     toDimacs (Neg i) = '-' : show (i + 1)
 
 dimacsHeader :: Int -> Int -> String
 dimacsHeader p_count clause_count = "p cnf " <> show p_count <> " " <> show clause_count
 
-instance ToDimacs Clause where
-    toDimacs  = foldr (\lit acc -> toDimacs lit ++ (' ' : acc)) "0" . unClause
+instance ToDimacs (Clause Int) where
+    toDimacs  = foldr (\lit acc -> toDimacs lit ++ (' ' : acc)) "0" . clause
 
-instance ToDimacs CNF where
-    toDimacs  = foldr (\clause acc -> toDimacs clause ++ ('\n' : acc)) "" . unCNF
+instance ToDimacs (CNF Int) where
+    toDimacs  = foldr (\c acc -> toDimacs c ++ ('\n' : acc)) "" . cnf
 
 instance ToCNF ElementaryConjunction where
-    toCnf = CNF . map (Clause . singleton) . unElemConj
+    toCnf = CNF . map (Clause . singleton) . elemConj
 
 instance ToCNF DNF where
-    toCnf = CNF . map Clause . sequence . map unElemConj . unDNF
+    toCnf = CNF . map Clause . sequence . map elemConj . dnf
 
 colToLayer :: Color -> Layer
 colToLayer White = LWhite
@@ -103,7 +119,7 @@ otherCol Black = White
 makeBoardCoord :: Int -> Int -> BoardCoord Layer
 makeBoardCoord n k = BoardCoord
     { size = n
-    , layer_count = layer_count
+    , layer_count = lc
     , forward_map = \case LWhite -> 0
                           LBlack -> 1
                           LSum x c -> 2 + k'*(fromEnum c) + x
@@ -115,19 +131,18 @@ makeBoardCoord n k = BoardCoord
     }
   where
     k' = k + 2 -- + 2 accounts for LSum (k + 1) and for LSum 0
-    layer_count = 2 + 2*(k')
+    lc = 2 + 2*(k')
 
-encodeNxNQueen :: BoardCoord Layer -> Int -> CNF
-encodeNxNQueen bc k = noSameSpot <> foldl' (\acc f -> f White <> f Black <> acc) mempty [sums, kOfColor] <> allSafe
+encodeNxNQueen :: Int -> Int -> CNF (Int, Int, Layer)
+encodeNxNQueen n k = noSameSpot <> foldl' (\acc f -> f White <> f Black <> acc) mempty [sums, kOfColor] <> allSafe
   where
-    n = size bc
     -- for all. x,y (encode x y White) != (encode x y Black) .. in truth values
     -- w = encode x y White
     -- b = encode x y White
     -- (w and not b) or (not w and b)
     -- (w or not w) and (w or b) and (not b or not w) and (not b or b)
     -- (w or b) and (not b or not w)
-    noSameSpot = CNF [ Clause $ map (Neg . encode bc x y) [LWhite, LBlack]
+    noSameSpot = CNF [ Clause $ map (Neg . (x,y,)) [LWhite, LBlack]
                      | x <- [0..(n - 1)], y <- [0..(n - 1)] ]
     -- exactly k tiles of color c are true
     -- k-clenna podmnozina [k]x[k] sjednocena na and <- DNF encoding, prevod na CNF exponencialni, mozna existuje lepsi reseni
@@ -135,7 +150,7 @@ encodeNxNQueen bc k = noSameSpot <> foldl' (\acc f -> f White <> f Black <> acc)
     --
     -- better version using `sums`:
     -- end_x,end_y,LSum k is true and end_x,end_y,LSum K+1 is false
-    kOfColor c = CNF [Clause [Pos $ encode bc (n - 1) (n - 1) $ LSum k c], Clause [Neg $ encode bc (n - 1) (n - 1) $ LSum (k + 1) c]]
+    kOfColor c = CNF [Clause [Pos ((n - 1), (n - 1), LSum k c)], Clause [Neg ((n - 1), (n - 1), LSum (k + 1) c)]]
 
     -- encodes that at x,y,(LSum z) the number of variables <x,<y,{LWhite,LBlack} is at least z
     -- x,y,(LSum z) <- (x,y)-1,(LSum z) or ((x,y)-1,(LSum z - 1) and (x,y),{LWhite|LBlack})
@@ -150,34 +165,34 @@ encodeNxNQueen bc k = noSameSpot <> foldl' (\acc f -> f White <> f Black <> acc)
     -- also need the other diction so it's an iff, not just <-, i.e. x,y,(LSum z) -> (x,y)-1,(LSum z) or ((x,y)-1,(LSum z - 1) and (x,y),{LWhite|LBlack})
     --                                                                  W         ->    X             or     Y                 and       Z
     --  3) not W or (X or (Y and Z)) = (not W or X) or (Y and Z) = (not W or X or Y) and (not W or X or Z)
-    sums c = CNF [ Clause [Pos $ encode bc 0 0 $ LSum 0 c]
-                 , Clause [Neg $ encode bc 0 0 $ LSum 1 c, Pos $ encode bc 0 0 $ colToLayer c] -- these two encode the case if a queen is on (0,0)
-                 , Clause [Pos $ encode bc 0 0 $ LSum 1 c, Neg $ encode bc 0 0 $ colToLayer c] --
+    sums c = CNF [ Clause [Pos (0, 0, LSum 0 c)]
+                 , Clause [Neg (0, 0, LSum 1 c), Pos (0, 0, colToLayer c)] -- these two encode the case if a queen is on (0,0)
+                 , Clause [Pos (0, 0, LSum 1 c), Neg (0, 0, colToLayer c)] --
                  ]
-          <> CNF [ Clause [Neg $ encode bc 0 0 $ LSum z c] -- propagate 0,0,LSum z>=2 is false
+          <> CNF [ Clause [Neg (0, 0, LSum z c)] -- propagate 0,0,LSum z>=2 is false
                  | z <- [2..k+1] ]
           <> encodeNext 0 0
       where
-        encodeRule1 x y prev_x prev_y = CNF [ Clause [Pos $ encode bc x y $ LSum z c, Neg $ encode bc prev_x prev_y $ LSum z c]
+        encodeRule1 x y prev_x prev_y = CNF [ Clause [Pos (x, y, LSum z c), Neg (prev_x, prev_y, LSum z c)]
                                             | z <- [0..k+1] ]
-        encodeRule2 x y prev_x prev_y = CNF [ Clause [ Pos $ encode bc x y $ LSum z c
-                                                     , Neg $ encode bc prev_x prev_y $ LSum (z - 1) c
-                                                     , Neg $ encode bc x y $ colToLayer c
+        encodeRule2 x y prev_x prev_y = CNF [ Clause [ Pos (x, y, LSum z c)
+                                                     , Neg (prev_x, prev_y, LSum (z - 1) c)
+                                                     , Neg (x, y, colToLayer c)
                                                      ]
                                             | z <- [1..k+1] ]
         encodeRule3 x y prev_x prev_y = CNF $ mconcat [ [ Clause [ prop z
                                                                  , prev_prop z
-                                                                 , Pos $ encode bc prev_x prev_y $ LSum (z - 1) c
+                                                                 , Pos (prev_x, prev_y, LSum (z - 1) c)
                                                                  ]
                                                         , Clause [ prop z
                                                                  , prev_prop z
-                                                                 , Pos $ encode bc x y $ colToLayer c
+                                                                 , Pos (x, y, colToLayer c)
                                                                  ]
                                                         ]
                                                       | z <- [1..k+1] ]
            where
-             prop z = Neg $ encode bc x y $ LSum z c
-             prev_prop z = Pos $ encode bc prev_x prev_y $ LSum z c
+             prop z = Neg (x, y, LSum z c)
+             prev_prop z = Pos (prev_x, prev_y, LSum z c)
         encodeNext x y = case advance x y of
                             Just (next_x, next_y) -> mconcat $ encodeNext next_x next_y : map (\f -> f next_x next_y x y) [encodeRule1, encodeRule2, encodeRule3]
                             Nothing -> CNF []
@@ -186,6 +201,7 @@ encodeNxNQueen bc k = noSameSpot <> foldl' (\acc f -> f White <> f Black <> acc)
             | y + 1 < n = Just (0, y + 1)
             | otherwise = Nothing
 
+    allSafe :: CNF (Int,Int,Layer)
     allSafe = mconcat [ safe x y c | x <- [0..n-1], y <- [0..n-1], c <- [White, Black] ]
 
     -- if x,y,c, then diagonals + x row + y column all are false for the other color
@@ -215,19 +231,69 @@ encodeNxNQueen bc k = noSameSpot <> foldl' (\acc f -> f White <> f Black <> acc)
         c' = colToLayer c
         otherC = otherCol c
         otherC' = colToLayer otherC
-        notA = Neg $ encode bc x y c'
+        notA = Neg (x, y, c')
 
-        row = CNF [ Clause [notA, Neg $ encode bc x' y $ otherC'] | x' <- [0..(n - 1)], x' /= x ]
-        column = CNF [ Clause [notA, Neg $ encode bc x y' $ otherC'] | y' <- [0..(n - 1)], y' /= y ]
-        diag dx dy xLim yLim = CNF [ Clause [ notA, Neg $ encode bc x' y' $ otherC' ]
+        row = CNF [ Clause [notA, Neg (x', y, otherC')] | x' <- [0..(n - 1)], x' /= x ]
+        column = CNF [ Clause [notA, Neg (x, y', otherC')] | y' <- [0..(n - 1)], y' /= y ]
+        diag dx dy xLim yLim = CNF [ Clause [ notA, Neg (x', y', otherC') ]
                                    | x' <- drop 1 [x,x+dx..xLim]
                                    | y' <- drop 1 [y,y+dy..yLim] ]
 
-variableCount :: CNF -> Int
-variableCount cnf = maximum $ map (maximum . map ((+1) . unLit) . unClause) $ unCNF cnf
+variableCount :: CNF Int -> Int
+variableCount = maximum . map (maximum . map ((+1) . unLit) . clause) . cnf
 
-fullDimacs :: CNF -> String
-fullDimacs cnf = dimacsHeader (variableCount cnf) (length $ unCNF $ cnf) <> ('\n' : toDimacs cnf)
+fullDimacs :: CNF Int -> String
+fullDimacs cnf_expr = dimacsHeader (variableCount cnf_expr) (length $ cnf $ cnf_expr) <> ('\n' : toDimacs cnf_expr)
+
+generateEncoding :: Int -> Int -> String
+generateEncoding n k = fullDimacs $ fmap (\(x,y,l) -> encode bc x y l) $ encodeNxNQueen n k
+  where
+    bc = makeBoardCoord n k
+
+runGlucose :: String -> a -> (String -> a -> a) -> IO a
+runGlucose input initial_state reader = do
+    (_, Just hStdout, _, hProcess) <- createProcess (proc "./glucose-syrup" [input]){ std_out = CreatePipe }
+
+    let loop state = do
+                        eof <- hIsEOF hStdout
+                        if eof
+                            then return state
+                            else hGetLine hStdout >>= loop . flip reader state
+    final_state <- loop initial_state
+    hClose hStdout
+    _ <- waitForProcess hProcess
+    return final_state
+
+
+parseGlucose :: String -> Maybe GlucoseRun -> Maybe GlucoseRun
+parseGlucose line prev_state = case parseGlucoseLine line of
+    SATState state -> maybe (pure $ GlucoseRun state Nothing) (\s -> pure $ s {satState = state}) prev_state
+    Comment _ -> prev_state
+    WhiteSpace -> prev_state
+  where
+    parseGlucoseLine :: String -> GlucoseLineOutput
+    parseGlucoseLine ('c':xs) = Comment $ dropWhile isSpace xs
+    parseGlucoseLine ('s':xs) = SATState $ isJust $ stripPrefix "SATISFIABLE" $ dropWhile isSpace xs
+    parseGlucoseLine _ = WhiteSpace
 
 main :: IO ()
-main = writeFile "encoding.cnf" $ fullDimacs $ encodeNxNQueen (makeBoardCoord 10 25) 25
+main = getArgs
+    >>= \case ["check", n_str, k_str] -> do
+                let (n,k) = join (***) (read @Int) (n_str, k_str)
+                putStr $ generateEncoding n k
+              ["solve", n_str] -> withSystemTempFile "encoding.cnf" $ \path h -> do
+                let n = read @Int n_str
+                hPutStr h $ generateEncoding n 2
+                hFlush h
+
+                stdout <- runGlucose path Nothing parseGlucose
+                print stdout
+              _ -> getProgName >>= putStr . usage
+  where
+    usage arg0 = unlines
+        [ "USAGE: " <> arg0 <> " [COMMAND]"
+        , ""
+        , "COMMANDS:"
+        , "\tcheck <n> <k>  ... generates a DIMANCS CNF encoding for the specified n,k values, outputs into stdout"
+        , "\tsolve <n>   ... finds the maximal k which is SAT for an nxn board"
+        ]
