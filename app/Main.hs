@@ -4,6 +4,7 @@
 {-# LANGUAGE ParallelListComp #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DeriveFoldable #-}
 {-# LANGUAGE TupleSections #-}
 
 module Main (main) where
@@ -11,14 +12,15 @@ module Main (main) where
 import Data.List (singleton, stripPrefix)
 import Control.Arrow (first, Arrow ((***)))
 
-import System.IO (hPutStr, hClose, hIsEOF, hGetLine, hFlush)
+import System.IO (hPutStr, hClose, hIsEOF, hGetLine, hFlush, Handle, hSetFileSize, SeekMode (AbsoluteSeek), hSeek)
 import System.IO.Temp (withSystemTempFile)
 import System.Environment (getArgs, getProgName)
 import System.Process (createProcess, std_out, waitForProcess, proc, StdStream(..))
 import Control.Monad (join)
 
 import Data.Char (isSpace)
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
+import Control.Applicative ((<|>))
 
 class ToDimacs a where
     toDimacs :: a -> String
@@ -28,16 +30,16 @@ class ToCNF t where
 
 data Lit a = Pos a
            | Neg a
-    deriving (Eq, Show)
+    deriving (Eq, Show, Foldable)
 unLit :: Lit a -> a
 unLit (Pos p) = p
 unLit (Neg p) = p
 
 newtype Clause a = Clause { clause :: [Lit a] }
-    deriving (Eq, Show, Functor, Semigroup, Monoid)
+    deriving (Eq, Show, Functor, Foldable, Semigroup, Monoid)
 
 newtype CNF a = CNF { cnf :: [Clause a] }
-    deriving (Eq, Show, Functor, Semigroup, Monoid)
+    deriving (Eq, Show, Functor, Foldable, Semigroup, Monoid)
 
 newtype ElementaryConjunction a = ElemConj { elemConj :: [Lit a] }
     deriving (Eq, Show, Functor, Semigroup, Monoid)
@@ -88,10 +90,9 @@ instance Functor Lit where
 
 instance BoardEncodeDecode Layer
 
--- dimacs variables start from 1, but already made the encoder use 0 based so + 1 is a quick hack (hopefully won't bite me later lol)
 instance ToDimacs (Lit Int) where
-    toDimacs (Pos i) = show $ i + 1
-    toDimacs (Neg i) = '-' : show (i + 1)
+    toDimacs (Pos i) = show i
+    toDimacs (Neg i) = '-' : show i
 
 dimacsHeader :: Int -> Int -> String
 dimacsHeader p_count clause_count = "p cnf " <> show p_count <> " " <> show clause_count
@@ -239,14 +240,11 @@ encodeNxNQueen n k = noSameSpot <> foldl' (\acc f -> f White <> f Black <> acc) 
                                    | x' <- drop 1 [x,x+dx..xLim]
                                    | y' <- drop 1 [y,y+dy..yLim] ]
 
-variableCount :: CNF Int -> Int
-variableCount = maximum . map (maximum . map ((+1) . unLit) . clause) . cnf
-
 fullDimacs :: CNF Int -> String
-fullDimacs cnf_expr = dimacsHeader (variableCount cnf_expr) (length $ cnf $ cnf_expr) <> ('\n' : toDimacs cnf_expr)
+fullDimacs cnf_expr = dimacsHeader (maximum cnf_expr) (length $ cnf cnf_expr) <> ('\n' : toDimacs cnf_expr)
 
 generateEncoding :: Int -> Int -> String
-generateEncoding n k = fullDimacs $ fmap (\(x,y,l) -> encode bc x y l) $ encodeNxNQueen n k
+generateEncoding n k = fullDimacs $ fmap (\(x,y,l) -> 1 + encode bc x y l) $ encodeNxNQueen n k
   where
     bc = makeBoardCoord n k
 
@@ -276,18 +274,27 @@ parseGlucose line prev_state = case parseGlucoseLine line of
     parseGlucoseLine ('s':xs) = SATState $ isJust $ stripPrefix "SATISFIABLE" $ dropWhile isSpace xs
     parseGlucoseLine _ = WhiteSpace
 
+solve :: Int -> IO (Maybe Int)
+solve n = withSystemTempFile "encoding.cnf" $ \path h -> solve' path h 0 Nothing
+  where
+    solve' pathEncoding hEncoding k bestK = do
+        putStrLn $ "k: " <> show k
+        hSeek hEncoding AbsoluteSeek 0
+        hSetFileSize hEncoding 0
+        hPutStr hEncoding $ generateEncoding n k
+        hFlush hEncoding
+
+        res <- runGlucose pathEncoding Nothing parseGlucose
+        if maybe False satState res
+            then solve' pathEncoding hEncoding (k + 1) (Just k)
+            else return bestK
+
 main :: IO ()
 main = getArgs
     >>= \case ["check", n_str, k_str] -> do
                 let (n,k) = join (***) (read @Int) (n_str, k_str)
                 putStr $ generateEncoding n k
-              ["solve", n_str] -> withSystemTempFile "encoding.cnf" $ \path h -> do
-                let n = read @Int n_str
-                hPutStr h $ generateEncoding n 2
-                hFlush h
-
-                stdout <- runGlucose path Nothing parseGlucose
-                print stdout
+              ["solve", n_str] -> solve (read @Int n_str) >>= print
               _ -> getProgName >>= putStr . usage
   where
     usage arg0 = unlines
