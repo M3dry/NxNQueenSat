@@ -12,14 +12,14 @@ module Main (main) where
 import Data.List (singleton, stripPrefix)
 import Control.Arrow (first, Arrow ((***)))
 
-import System.IO (hPutStr, hClose, hIsEOF, hGetLine, hFlush, Handle, hSetFileSize, SeekMode (AbsoluteSeek), hSeek)
+import System.IO (hPutStr, hClose, hIsEOF, hGetLine, hFlush, hSetFileSize, SeekMode (AbsoluteSeek), hSeek)
 import System.IO.Temp (withSystemTempFile)
 import System.Environment (getArgs, getProgName)
 import System.Process (createProcess, std_out, waitForProcess, proc, StdStream(..))
 import Control.Monad (join)
 
 import Data.Char (isSpace)
-import Data.Maybe (isJust, isNothing)
+import Data.Maybe (isJust)
 import Control.Applicative ((<|>))
 
 class ToDimacs a where
@@ -275,19 +275,25 @@ parseGlucose line prev_state = case parseGlucoseLine line of
     parseGlucoseLine _ = WhiteSpace
 
 solve :: Int -> IO (Maybe Int)
-solve n = withSystemTempFile "encoding.cnf" $ \path h -> solve' path h 0 Nothing
+solve n = withSystemTempFile "encoding.cnf" $ curry (maxK . uncurry solvers)
   where
-    solve' pathEncoding hEncoding k bestK = do
-        putStrLn $ "k: " <> show k
+    maxK = foldr (\r acc -> r >>= maybe (pure Nothing)
+                                        ((<$> acc) . flip (<|>) . Just))
+                (pure Nothing)
+
+    solvers pathEncoding hEncoding = map (solver pathEncoding hEncoding) [1..]
+    solver pathEncoding hEncoding k = do
+        putStrLn $ "trying k=" <> show k
         hSeek hEncoding AbsoluteSeek 0
         hSetFileSize hEncoding 0
         hPutStr hEncoding $ generateEncoding n k
         hFlush hEncoding
 
-        res <- runGlucose pathEncoding Nothing parseGlucose
-        if maybe False satState res
-            then solve' pathEncoding hEncoding (k + 1) (Just k)
-            else return bestK
+        run <- runGlucose pathEncoding Nothing parseGlucose
+        pure $ case run of
+            Nothing -> Nothing
+            Just (GlucoseRun {satState = False}) -> Nothing
+            Just _ -> Just k
 
 main :: IO ()
 main = getArgs
