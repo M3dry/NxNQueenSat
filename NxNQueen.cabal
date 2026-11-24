@@ -18,7 +18,8 @@ common warnings
 executable NxNQueen
     import:           warnings
     main-is:          Main.hs
-    -- other-modules:
+    other-modules:
+        , SATTypes
     -- other-extensions:
     build-depends:
         , base ^>=4.20.2.0
