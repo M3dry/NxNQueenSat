@@ -311,7 +311,7 @@ main :: IO ()
 main =
     getArgs
         >>= \case
-            ["check", n_str, k_str] -> do
+            ["encode", n_str, k_str] -> do
                 let (n, k) = join (***) (read @Int) (n_str, k_str)
                 putStr $ generateEncoding n k
             ["solve", n_str] -> do
@@ -322,7 +322,9 @@ main =
                     Just (k, model) -> do
                         let (black, white) = join (***) (map (\(x, y, _) -> (x, y))) $ partition (\case (_, _, Black) -> True; _ -> False) $ mapMaybe (\case Pos (x, y, c@LColor) -> Just (x, y, layerToCol c); _ -> Nothing) model
                         putStrLn $ "The maximal k for n=" <> n_str <> " is: " <> show k
-                        putStrLn $ drawGrid n white black
+
+                        putStrLn "\nExample solution:"
+                        putStr $ drawGrid n white black
             _ -> getProgName >>= putStr . usage
   where
     usage arg0 =
@@ -330,8 +332,8 @@ main =
             [ "USAGE: " <> arg0 <> " [COMMAND]"
             , ""
             , "COMMANDS:"
-            , "\tcheck <n> <k>  ... generates a DIMANCS CNF encoding for the specified n,k values, outputs into stdout"
-            , "\tsolve <n>   ... finds the maximal k which is SAT for an nxn board"
+            , "\tencode <n> <k>  ... generates a DIMANCS CNF encoding for the specified n,k values, outputs into stdout"
+            , "\tsolve  <n>   ... finds the maximal k which is SAT for an nxn board"
             ]
 
 drawGrid :: Int -> [(Int, Int)] -> [(Int, Int)] -> String
